@@ -27,6 +27,11 @@ on:
         required: false
         default: ''
         type: string
+      ipa_name:
+        description: Optional IPA file name; blank = built app product name
+        required: false
+        default: ''
+        type: string
       correlation_id:
         description: Correlation id from desktop tool
         required: true
@@ -145,6 +150,7 @@ jobs:
         env:
           CONFIGURATION: ${{ inputs.configuration }}
           CORRELATION: ${{ inputs.correlation_id }}
+          REQUESTED_IPA_NAME: ${{ inputs.ipa_name }}
         run: |
           set -euo pipefail
           PRODUCT_DIR="$GITHUB_WORKSPACE/DerivedData/Build/Products/${CONFIGURATION}-iphoneos"
@@ -156,19 +162,35 @@ jobs:
           fi
 
           APP_NAME="$(basename "$APP" .app)"
-          SAFE_NAME="$(echo "$APP_NAME" | tr ' /:' '___')"
+          if [[ -n "$REQUESTED_IPA_NAME" ]]; then
+            BASE_NAME="$REQUESTED_IPA_NAME"
+          else
+            BASE_NAME="$APP_NAME"
+          fi
+
+          SAFE_NAME="$(python3 - "$BASE_NAME" <<'PY'
+          import re, sys
+          name = sys.argv[1].strip()
+          if name.lower().endswith('.ipa'):
+              name = name[:-4]
+          name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', name)
+          name = name.strip().rstrip('.')
+          print((name or 'App')[:120].rstrip())
+          PY
+          )"
+
           OUT="$GITHUB_WORKSPACE/ipa-output"
           mkdir -p "$OUT/Payload"
           ditto "$APP" "$OUT/Payload/$(basename "$APP")"
           cd "$OUT"
-          /usr/bin/zip -qry "${SAFE_NAME}_unsigned.ipa" Payload
+          /usr/bin/zip -qry "${SAFE_NAME}.ipa" Payload
           rm -rf Payload
-          echo "ipa=$OUT/${SAFE_NAME}_unsigned.ipa" >> "$GITHUB_OUTPUT"
+          echo "ipa=$OUT/${SAFE_NAME}.ipa" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: unsigned-ipa-${{ inputs.correlation_id }}
+          name: ipa-${{ inputs.correlation_id }}
           path: ${{ steps.package.outputs.ipa }}
           if-no-files-found: error
           retention-days: 7
