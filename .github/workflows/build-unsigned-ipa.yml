@@ -1,0 +1,182 @@
+name: Build Unsigned IPA
+run-name: IPA ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Temporary GitHub release id containing Xcode ZIP
+        required: true
+        type: string
+      asset_name:
+        description: ZIP asset name
+        required: true
+        type: string
+      scheme:
+        description: Xcode scheme; blank = auto detect
+        required: false
+        default: ''
+        type: string
+      configuration:
+        description: Xcode configuration
+        required: false
+        default: Release
+        type: string
+      bundle_id:
+        description: Optional PRODUCT_BUNDLE_IDENTIFIER override
+        required: false
+        default: ''
+        type: string
+      correlation_id:
+        description: Correlation id from desktop tool
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Download Xcode ZIP from temporary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          ASSET_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            --jq ".assets[] | select(.name == \"${ASSET_NAME}\") | .id" | head -n 1)"
+          if [[ -z "$ASSET_ID" ]]; then
+            echo "Cannot find release asset: $ASSET_NAME" >&2
+            exit 1
+          fi
+          gh api -H "Accept: application/octet-stream" \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" > xcode-input.zip
+          mkdir -p source
+          ditto -x -k xcode-input.zip source
+
+      - name: Detect Xcode project/workspace and scheme
+        id: detect
+        env:
+          REQUESTED_SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$(find source -type d -name '*.xcworkspace' ! -path '*.xcodeproj/*' -print | head -n 1 || true)"
+          PROJECT="$(find source -type d -name '*.xcodeproj' -print | head -n 1 || true)"
+
+          if [[ -n "$WORKSPACE" ]]; then
+            KIND="workspace"
+            CONTAINER="$WORKSPACE"
+            xcodebuild -list -json -workspace "$CONTAINER" > /tmp/xcode-list.json
+          elif [[ -n "$PROJECT" ]]; then
+            KIND="project"
+            CONTAINER="$PROJECT"
+            xcodebuild -list -json -project "$CONTAINER" > /tmp/xcode-list.json
+          else
+            echo "No .xcworkspace or .xcodeproj found inside uploaded ZIP." >&2
+            exit 1
+          fi
+
+          SCHEME="$REQUESTED_SCHEME"
+          if [[ -z "$SCHEME" ]]; then
+            SCHEME="$(python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/xcode-list.json'))
+          schemes=[]
+          for key in ('workspace','project'):
+              obj=data.get(key) or {}
+              schemes.extend(obj.get('schemes') or [])
+          if 'Unity-iPhone' in schemes:
+              print('Unity-iPhone')
+          elif schemes:
+              print(schemes[0])
+          PY
+          )"
+          fi
+
+          if [[ -z "$SCHEME" ]]; then
+            echo "Cannot auto-detect an Xcode scheme. Enter Scheme in the desktop tool." >&2
+            cat /tmp/xcode-list.json
+            exit 1
+          fi
+
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Using $KIND: $CONTAINER"
+          echo "Using scheme: $SCHEME"
+
+      - name: Build unsigned iPhoneOS app
+        env:
+          KIND: ${{ steps.detect.outputs.kind }}
+          CONTAINER: ${{ steps.detect.outputs.container }}
+          SCHEME: ${{ steps.detect.outputs.scheme }}
+          CONFIGURATION: ${{ inputs.configuration }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            -scheme "$SCHEME"
+            -configuration "$CONFIGURATION"
+            -sdk iphoneos
+            -derivedDataPath "$GITHUB_WORKSPACE/DerivedData"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+          )
+          if [[ -n "$BUNDLE_ID" ]]; then
+            ARGS+=(PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID")
+          fi
+
+          if [[ "$KIND" == "workspace" ]]; then
+            xcodebuild -workspace "$CONTAINER" "${ARGS[@]}" build
+          else
+            xcodebuild -project "$CONTAINER" "${ARGS[@]}" build
+          fi
+
+      - name: Package unsigned IPA
+        id: package
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+          CORRELATION: ${{ inputs.correlation_id }}
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="$GITHUB_WORKSPACE/DerivedData/Build/Products/${CONFIGURATION}-iphoneos"
+          APP="$(find "$PRODUCT_DIR" -maxdepth 2 -type d -name '*.app' -print | head -n 1 || true)"
+          if [[ -z "$APP" ]]; then
+            echo "No .app found under $PRODUCT_DIR" >&2
+            find "$GITHUB_WORKSPACE/DerivedData/Build/Products" -maxdepth 4 -type d -name '*.app' -print || true
+            exit 1
+          fi
+
+          APP_NAME="$(basename "$APP" .app)"
+          SAFE_NAME="$(echo "$APP_NAME" | tr ' /:' '___')"
+          OUT="$GITHUB_WORKSPACE/ipa-output"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP" "$OUT/Payload/$(basename "$APP")"
+          cd "$OUT"
+          /usr/bin/zip -qry "${SAFE_NAME}_unsigned.ipa" Payload
+          rm -rf Payload
+          echo "ipa=$OUT/${SAFE_NAME}_unsigned.ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa-${{ inputs.correlation_id }}
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Delete temporary input release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" || true
